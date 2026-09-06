@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: MessagePlatformAdapter
+metadata:
+  name: octo
+  label:
+    en_US: Octo
+    zh_Hans: Octo
+    zh_Hant: Octo
+  description:
+    en_US: Octo IM adapter, connects to a self-hosted Octo server via bot token (supports DMs, groups and sub-group threads)
+    zh_Hans: Octo IM 适配器，通过机器人令牌连接自部署的 Octo 服务器（支持私聊、群聊与子群话题）
+    zh_Hant: Octo IM 適配器，透過機器人令牌連接自部署的 Octo 伺服器（支援私聊、群聊與子群話題）
+  icon: octo.svg
+spec:
+  categories:
+    - china
+  config:
+    - name: bot_token
+      label:
+        en_US: Bot Token
+        zh_Hans: 机器人令牌
+        zh_Hant: 機器人令牌
+      description:
+        en_US: Bot token created via BotFather in Octo. Use a User Bot token (bf_ prefix, full group and thread access); App Bot tokens (app_ prefix) are restricted to direct messages by the server.
+        zh_Hans: 在 Octo 中通过 BotFather 创建的机器人令牌。请使用 User Bot 令牌（bf_ 前缀，具备完整群聊与话题权限）；App Bot 令牌（app_ 前缀）被服务端限制为仅私聊。
+        zh_Hant: 在 Octo 中透過 BotFather 建立的機器人令牌。請使用 User Bot 令牌（bf_ 前綴，具備完整群聊與話題權限）；App Bot 令牌（app_ 前綴）被伺服端限制為僅私聊。
+      type: string
+      required: true
+      default: ""
+    - name: api_url
+      label:
+        en_US: API Base URL
+        zh_Hans: API 基础地址
+        zh_Hant: API 基礎地址
+      description:
+        en_US: Octo server REST API base URL, including the /api mount (e.g. https://your-server/api)
+        zh_Hans: Octo 服务器 REST API 基础地址，包含 /api 路径（例如 https://your-server/api）
+        zh_Hant: Octo 伺服器 REST API 基礎地址，包含 /api 路徑（例如 https://your-server/api）
+      type: string
+      required: true
+      default: "http://localhost:8090/api"
+    - name: ws_url
+      label:
+        en_US: WebSocket URL
+        zh_Hans: WebSocket 地址
+        zh_Hant: WebSocket 地址
+      description:
+        en_US: Optional. Leave empty to use the WebSocket URL returned by the server during bot registration.
+        zh_Hans: 可选。留空则使用机器人注册时服务器返回的 WebSocket 地址。
+        zh_Hant: 可選。留空則使用機器人註冊時伺服器返回的 WebSocket 地址。
+      type: string
+      required: false
+      default: ""
+execution:
+  python:
+    path: ./octo.py
+    attr: OctoAdapter
