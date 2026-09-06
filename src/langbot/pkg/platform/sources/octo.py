@@ -25,7 +25,11 @@ from langbot.libs.octo_api import (
     OctoWSClient,
     PayloadType,
 )
+from langbot.libs.octo_api import media as octo_media
 from langbot.libs.octo_api.types import MentionInfo, is_thread_channel
+
+import base64
+import os
 
 import langbot_plugin.api.definition.abstract.platform.adapter as abstract_platform_adapter
 import langbot_plugin.api.definition.abstract.platform.event_logger as abstract_platform_logger
@@ -60,8 +64,9 @@ class OctoMessageConverter(abstract_platform_adapter.AbstractMessageConverter):
     @staticmethod
     async def yiri2target(
         message_chain: platform_message.MessageChain,
-    ) -> tuple[str, typing.Optional[dict]]:
-        """Convert a MessageChain to (text content, mention dict or None).
+    ) -> tuple[str, typing.Optional[dict], list[platform_message.MessageComponent]]:
+        """Convert a MessageChain to (text content, mention dict or None,
+        media components to send separately).
 
         Mention entity offsets are computed in UTF-16 code units over the
         final content, and length includes the '@' sign.
@@ -70,6 +75,7 @@ class OctoMessageConverter(abstract_platform_adapter.AbstractMessageConverter):
         uids: list[str] = []
         entities: list[dict] = []
         mention_all = False
+        media: list[platform_message.MessageComponent] = []
 
         for component in message_chain:
             if isinstance(component, platform_message.Plain):
@@ -92,13 +98,11 @@ class OctoMessageConverter(abstract_platform_adapter.AbstractMessageConverter):
             elif isinstance(component, platform_message.Forward):
                 for node in component.node_list:
                     if node.message_chain:
-                        sub_content, _ = await OctoMessageConverter.yiri2target(node.message_chain)
+                        sub_content, _, sub_media = await OctoMessageConverter.yiri2target(node.message_chain)
                         content += sub_content + '\n'
-            elif isinstance(component, platform_message.Image):
-                # Media outbound lands in P2; keep the conversation coherent.
-                content += '[image]'
-            elif isinstance(component, platform_message.File):
-                content += f'[file: {component.name or ""}]'
+                        media.extend(sub_media)
+            elif isinstance(component, (platform_message.Image, platform_message.File, platform_message.Voice)):
+                media.append(component)
 
         mention: typing.Optional[dict] = None
         if uids or entities or mention_all:
@@ -109,11 +113,20 @@ class OctoMessageConverter(abstract_platform_adapter.AbstractMessageConverter):
                 mention['entities'] = entities
             if mention_all:
                 mention['all'] = 1
-        return content, mention
+        return content, mention, media
 
     @staticmethod
-    async def target2yiri(msg: OctoMessage, bot_uid: str) -> platform_message.MessageChain:
-        """Convert an inbound Octo message to a MessageChain."""
+    async def target2yiri(
+        msg: OctoMessage,
+        bot_uid: str,
+        downloads: typing.Optional[dict[str, tuple[bytes, str]]] = None,
+    ) -> platform_message.MessageChain:
+        """Convert an inbound Octo message to a MessageChain.
+
+        downloads maps a payload url to its downloaded (bytes, mime), filled
+        by the adapter before conversion.
+        """
+        downloads = downloads or {}
         components: list[platform_message.MessageComponent] = []
         payload = msg.payload
 
@@ -133,20 +146,44 @@ class OctoMessageConverter(abstract_platform_adapter.AbstractMessageConverter):
             text = payload.content if isinstance(payload.content, str) else ''
             components.extend(OctoMessageConverter._split_text_with_mentions(text, payload.mention, bot_uid))
         elif payload.type == PayloadType.RICH_TEXT:
-            components.extend(OctoMessageConverter._richtext_components(payload))
+            components.extend(OctoMessageConverter._richtext_components(payload, downloads))
         elif payload.type == PayloadType.INTERACTIVE_CARD:
             # Never parse the card tree inbound; the server-generated plain
             # text is authoritative.
             plain = getattr(payload, 'plain', None) or '[卡片]'
             components.append(platform_message.Plain(text=plain))
         elif payload.type in (PayloadType.IMAGE, PayloadType.GIF):
-            components.append(platform_message.Unknown(text='[Image]'))
+            hit = downloads.get(payload.url or '')
+            if hit:
+                data, mime = hit
+                b64 = (await asyncio.to_thread(base64.b64encode, data)).decode('ascii')
+                components.append(platform_message.Image(base64=f'data:{mime};base64,{b64}'))
+            else:
+                components.append(platform_message.Unknown(text='[Image]'))
         elif payload.type == PayloadType.VOICE:
-            components.append(platform_message.Unknown(text='[Voice]'))
+            hit = downloads.get(payload.url or '')
+            if hit:
+                data, _ = hit
+                b64 = (await asyncio.to_thread(base64.b64encode, data)).decode('ascii')
+                components.append(platform_message.Voice(base64=b64))
+            else:
+                components.append(platform_message.Unknown(text='[Voice]'))
         elif payload.type == PayloadType.VIDEO:
             components.append(platform_message.Unknown(text='[Video]'))
         elif payload.type == PayloadType.FILE:
-            components.append(platform_message.Unknown(text=f'[File: {payload.name or ""}]'))
+            hit = downloads.get(payload.url or '')
+            if hit:
+                data, _ = hit
+                b64 = (await asyncio.to_thread(base64.b64encode, data)).decode('ascii')
+                components.append(
+                    platform_message.File(
+                        name=payload.name or 'file',
+                        size=payload.size or len(data),
+                        base64=b64,
+                    )
+                )
+            else:
+                components.append(platform_message.Unknown(text=f'[File: {payload.name or ""}]'))
         else:
             components.append(platform_message.Unknown(text='[Unsupported message type]'))
 
@@ -182,9 +219,13 @@ class OctoMessageConverter(abstract_platform_adapter.AbstractMessageConverter):
         return ''
 
     @staticmethod
-    def _richtext_components(payload) -> list[platform_message.MessageComponent]:
+    def _richtext_components(
+        payload,
+        downloads: typing.Optional[dict[str, tuple[bytes, str]]] = None,
+    ) -> list[platform_message.MessageComponent]:
         """RichText(14) content is an ordered block array; string content is
         the backward-compatible single text block."""
+        downloads = downloads or {}
         components: list[platform_message.MessageComponent] = []
         content = payload.content
         if isinstance(content, str):
@@ -196,7 +237,13 @@ class OctoMessageConverter(abstract_platform_adapter.AbstractMessageConverter):
                 if block.get('type') == 'text' and block.get('text'):
                     components.append(platform_message.Plain(text=block['text']))
                 elif block.get('type') == 'image':
-                    components.append(platform_message.Unknown(text='[图片]'))
+                    hit = downloads.get(block.get('url') or '')
+                    if hit:
+                        data, mime = hit
+                        b64 = base64.b64encode(data).decode('ascii')
+                        components.append(platform_message.Image(base64=f'data:{mime};base64,{b64}'))
+                    else:
+                        components.append(platform_message.Unknown(text='[图片]'))
         if not components:
             plain = getattr(payload, 'plain', None)
             if isinstance(plain, str) and plain:
@@ -262,7 +309,9 @@ class OctoEventConverter(abstract_platform_adapter.AbstractEventConverter):
 
     @staticmethod
     async def target2yiri(
-        msg: OctoMessage, bot_uid: str
+        msg: OctoMessage,
+        bot_uid: str,
+        downloads: typing.Optional[dict[str, tuple[bytes, str]]] = None,
     ) -> typing.Optional[platform_events.MessageEvent]:
         # System events (group_md_updated etc.) ride on ordinary messages.
         if msg.payload.event is not None:
@@ -273,7 +322,7 @@ class OctoEventConverter(abstract_platform_adapter.AbstractEventConverter):
         if not msg.from_uid:
             return None
 
-        message_chain = await OctoMessageConverter.target2yiri(msg, bot_uid)
+        message_chain = await OctoMessageConverter.target2yiri(msg, bot_uid, downloads)
         if not message_chain:
             return None
 
@@ -357,15 +406,7 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
         else:
             channel_type = ChannelType.COMMUNITY_TOPIC if is_thread_channel(target_id) else ChannelType.GROUP
         self._stop_typing(target_id)
-        content, mention = await OctoMessageConverter.yiri2target(message)
-        if not content.strip():
-            return
-        await self._rest.send_text(
-            channel_id=target_id,
-            channel_type=channel_type,
-            content=content,
-            mention=mention,
-        )
+        await self._send_chain(target_id, channel_type, message)
 
     async def reply_message(
         self,
@@ -383,20 +424,110 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
         channel_id, channel_type = self._reply_channel(source_msg)
         self._stop_typing(channel_id)
 
-        content, mention = await OctoMessageConverter.yiri2target(message)
-        if not content.strip():
-            return
         reply = None
         if quote_origin:
             from_name = await self._resolve_user_name(source_msg.from_uid)
             reply = OctoMessageConverter.build_reply_quote(source_msg, from_name)
-        await self._rest.send_text(
-            channel_id=channel_id,
-            channel_type=channel_type,
-            content=content,
-            mention=mention,
-            reply=reply,
-        )
+        await self._send_chain(channel_id, channel_type, message, reply=reply)
+
+    async def _send_chain(
+        self,
+        channel_id: str,
+        channel_type: int,
+        message: platform_message.MessageChain,
+        reply: typing.Optional[dict] = None,
+    ) -> None:
+        """Send text first (with mention/quote), then each media component."""
+        content, mention, media = await OctoMessageConverter.yiri2target(message)
+        if content.strip():
+            await self._rest.send_text(
+                channel_id=channel_id,
+                channel_type=channel_type,
+                content=content,
+                mention=mention,
+                reply=reply,
+            )
+        for component in media:
+            try:
+                await self._send_media_component(channel_id, channel_type, component)
+            except Exception:
+                await self.logger.error(
+                    f'Octo failed to send {type(component).__name__}: {traceback.format_exc()}'
+                )
+
+    async def _send_media_component(
+        self,
+        channel_id: str,
+        channel_type: int,
+        component: platform_message.MessageComponent,
+    ) -> None:
+        data = await self._get_component_bytes(component)
+        if not data:
+            await self.logger.warning(f'Octo media component {type(component).__name__} has no content, skipped')
+            return
+        if isinstance(component, platform_message.Image):
+            mime = octo_media.sniff_image_mime(data)
+            name = f'image{octo_media.extension_for_mime(mime)}'
+            url = await self._rest.upload_media(name, data, mime)
+            dims = octo_media.sniff_image_dimensions(data)
+            await self._rest.send_media(
+                channel_id,
+                channel_type,
+                PayloadType.IMAGE,
+                url,
+                name=name,
+                size=len(data),
+                width=dims[0] if dims else None,
+                height=dims[1] if dims else None,
+            )
+        elif isinstance(component, platform_message.Voice):
+            name = 'voice.mp3'
+            url = await self._rest.upload_media(name, data, 'audio/mpeg')
+            await self._rest.send_media(channel_id, channel_type, PayloadType.VOICE, url, name=name, size=len(data))
+        else:  # File
+            name = getattr(component, 'name', '') or 'file.bin'
+            content_type = octo_media.infer_content_type(name)
+            url = await self._rest.upload_media(name, data, content_type)
+            await self._rest.send_media(channel_id, channel_type, PayloadType.FILE, url, name=name, size=len(data))
+
+    @staticmethod
+    async def _get_component_bytes(component: platform_message.MessageComponent) -> typing.Optional[bytes]:
+        """Extract raw bytes from an Image/File/Voice component (base64/url/path)."""
+        if isinstance(component, platform_message.Image):
+            try:
+                data, _ = await component.get_bytes()
+                if data and len(data) <= octo_media.MAX_UPLOAD_BYTES:
+                    return data
+                return None
+            except Exception:
+                pass
+        b64_val = getattr(component, 'base64', None)
+        url_val = getattr(component, 'url', None)
+        path_val = getattr(component, 'path', None)
+        if b64_val:
+            if ',' in b64_val[:80] and b64_val.startswith('data:'):
+                b64_val = b64_val.split(',', 1)[1]
+            data = await asyncio.to_thread(base64.b64decode, b64_val)
+            return data if len(data) <= octo_media.MAX_UPLOAD_BYTES else None
+        if url_val and url_val.startswith(('http://', 'https://')):
+            from langbot.pkg.utils import httpclient
+
+            session = httpclient.get_session()
+            async with session.get(url_val) as resp:
+                if resp.status == 200:
+                    return await httpclient.read_limited(resp, max_bytes=octo_media.MAX_UPLOAD_BYTES)
+            return None
+        if path_val:
+            if await asyncio.to_thread(os.path.getsize, path_val) > octo_media.MAX_UPLOAD_BYTES:
+                return None
+
+            def read_file() -> bytes:
+                with open(path_val, 'rb') as f:
+                    return f.read(octo_media.MAX_UPLOAD_BYTES + 1)
+
+            data = await asyncio.to_thread(read_file)
+            return data if len(data) <= octo_media.MAX_UPLOAD_BYTES else None
+        return None
 
     async def _resolve_user_name(self, uid: str) -> str:
         """Display name for a uid, via /v1/bot/user/info with a bounded cache."""
@@ -486,7 +617,8 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
 
     async def _handle_inbound_message(self, msg: OctoMessage):
         try:
-            event = await OctoEventConverter.target2yiri(msg, self.bot_account_id)
+            downloads = await self._download_inbound_media(msg)
+            event = await OctoEventConverter.target2yiri(msg, self.bot_account_id, downloads)
         except Exception:
             await self.logger.error(f'Octo event conversion error: {traceback.format_exc()}')
             return
@@ -533,6 +665,55 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
             except Exception:
                 pass
             await asyncio.sleep(TYPING_INTERVAL_SECONDS)
+
+    async def _download_inbound_media(self, msg: OctoMessage) -> dict[str, tuple[bytes, str]]:
+        """Download media referenced by an inbound message, keyed by payload url.
+
+        Inline media (image/gif/voice, and richtext images) is public-read: no
+        auth. File content requires the Bearer token. Oversized or failed
+        downloads are skipped; the converter falls back to placeholders.
+        """
+        downloads: dict[str, tuple[bytes, str]] = {}
+        if self._rest is None:
+            return downloads
+        api_url = self.config.get('api_url', '')
+        cdn_url = self.config.get('cdn_url', '')
+        payload = msg.payload
+
+        async def fetch(rel_url: typing.Optional[str], with_auth: bool, mime_hint: str = '') -> None:
+            if not rel_url or rel_url in downloads:
+                return
+            full_url = octo_media.build_media_url(rel_url, api_url, cdn_url)
+            if not full_url:
+                return
+            try:
+                data = await self._rest.download_media(
+                    full_url, with_auth=with_auth, max_bytes=octo_media.MAX_INBOUND_INLINE_BYTES
+                )
+            except Exception:
+                await self.logger.warning(f'Octo media download failed: {traceback.format_exc()}')
+                return
+            if data:
+                mime = octo_media.sniff_image_mime(data)
+                if mime == 'application/octet-stream' and mime_hint:
+                    mime = mime_hint
+                downloads[rel_url] = (data, mime)
+
+        if payload.type in (PayloadType.IMAGE, PayloadType.GIF):
+            await fetch(payload.url, with_auth=False)
+        elif payload.type == PayloadType.VOICE:
+            await fetch(payload.url, with_auth=False, mime_hint='audio/mpeg')
+        elif payload.type == PayloadType.FILE:
+            await fetch(payload.url, with_auth=True, mime_hint='application/octet-stream')
+        elif payload.type == PayloadType.RICH_TEXT and isinstance(payload.content, list):
+            image_urls = [
+                block.get('url')
+                for block in payload.content
+                if isinstance(block, dict) and block.get('type') == 'image' and block.get('url')
+            ]
+            for url in image_urls[:4]:
+                await fetch(url, with_auth=False)
+        return downloads
 
     async def kill(self) -> bool:
         for channel_id in list(self._typing_tasks):

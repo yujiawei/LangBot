@@ -99,7 +99,7 @@ class TestOutbound:
     @pytest.mark.asyncio
     async def test_plain_text(self):
         chain = platform_message.MessageChain([platform_message.Plain(text='hello')])
-        content, mention = await OctoMessageConverter.yiri2target(chain)
+        content, mention, media = await OctoMessageConverter.yiri2target(chain)
         assert content == 'hello'
         assert mention is None
 
@@ -112,7 +112,7 @@ class TestOutbound:
                 platform_message.Plain(text='收到'),
             ]
         )
-        content, mention = await OctoMessageConverter.yiri2target(chain)
+        content, mention, media = await OctoMessageConverter.yiri2target(chain)
         assert content == '👍@张三 收到'
         entity = mention['entities'][0]
         assert entity['uid'] == 'uid1'
@@ -123,7 +123,7 @@ class TestOutbound:
     @pytest.mark.asyncio
     async def test_at_all(self):
         chain = platform_message.MessageChain([platform_message.AtAll()])
-        content, mention = await OctoMessageConverter.yiri2target(chain)
+        content, mention, media = await OctoMessageConverter.yiri2target(chain)
         assert '@所有人' in content
         assert mention['all'] == 1
 
@@ -227,3 +227,77 @@ class TestReplyQuote:
         msg = _msg({'type': 1, 'content': 'hi'})
         quote = OctoMessageConverter.build_reply_quote(msg, '')
         assert quote['from_name'] == 'user1'
+
+
+class TestMedia:
+    @pytest.mark.asyncio
+    async def test_outbound_collects_media_components(self):
+        chain = platform_message.MessageChain(
+            [
+                platform_message.Plain(text='看这张图'),
+                platform_message.Image(base64='data:image/png;base64,aGk='),
+                platform_message.File(name='report.pdf'),
+            ]
+        )
+        content, mention, media = await OctoMessageConverter.yiri2target(chain)
+        assert content == '看这张图'
+        assert len(media) == 2
+        assert isinstance(media[0], platform_message.Image)
+        assert isinstance(media[1], platform_message.File)
+
+    @pytest.mark.asyncio
+    async def test_inbound_image_with_download(self):
+        png = b'\x89PNG\r\n\x1a\n' + b'\x00' * 30
+        payload = {'type': 2, 'url': 'file/abc.png', 'name': 'abc.png', 'size': 38}
+        chain = await OctoMessageConverter.target2yiri(
+            _msg(payload), BOT_UID, downloads={'file/abc.png': (png, 'image/png')}
+        )
+        images = [c for c in chain if isinstance(c, platform_message.Image)]
+        assert len(images) == 1
+        assert images[0].base64.startswith('data:image/png;base64,')
+
+    @pytest.mark.asyncio
+    async def test_inbound_image_without_download_falls_back(self):
+        payload = {'type': 2, 'url': 'file/abc.png'}
+        chain = await OctoMessageConverter.target2yiri(_msg(payload), BOT_UID)
+        assert any(isinstance(c, platform_message.Unknown) for c in chain)
+
+    @pytest.mark.asyncio
+    async def test_inbound_file_with_download(self):
+        payload = {'type': 8, 'url': 'file/doc.txt', 'name': 'doc.txt', 'size': 5}
+        chain = await OctoMessageConverter.target2yiri(
+            _msg(payload), BOT_UID, downloads={'file/doc.txt': (b'hello', 'text/plain')}
+        )
+        files = [c for c in chain if isinstance(c, platform_message.File)]
+        assert len(files) == 1
+        assert files[0].name == 'doc.txt'
+
+
+class TestMediaHelpers:
+    def test_build_media_url(self):
+        from langbot.libs.octo_api import media as m
+
+        api = 'https://im.example.com/api'
+        assert m.build_media_url('http://x/y.png', api) == 'http://x/y.png'
+        assert m.build_media_url('file/a/b.png', api) == 'https://im.example.com/api/file/a/b.png'
+        assert m.build_media_url('file/preview/a.png', api) == 'https://im.example.com/api/file/a.png'
+        assert m.build_media_url('file/a.png', api, 'https://cdn.example.com') == 'https://cdn.example.com/a.png'
+        assert m.build_media_url('', api) is None
+
+    def test_sniff_png_dimensions(self):
+        import struct
+        from langbot.libs.octo_api import media as m
+
+        header = b'\x89PNG\r\n\x1a\n' + b'\x00\x00\x00\rIHDR' + struct.pack('>II', 640, 480) + b'\x00' * 10
+        assert m.sniff_image_dimensions(header) == (640, 480)
+        assert m.sniff_image_mime(header) == 'image/png'
+
+    def test_sniff_gif_and_jpeg(self):
+        import struct
+        from langbot.libs.octo_api import media as m
+
+        gif = b'GIF89a' + struct.pack('<HH', 100, 50) + b'\x00' * 20
+        assert m.sniff_image_dimensions(gif) == (100, 50)
+        jpeg = b'\xff\xd8\xff\xc0\x00\x11\x08' + struct.pack('>HH', 480, 640) + b'\x00' * 20
+        assert m.sniff_image_dimensions(jpeg) == (640, 480)
+        assert m.sniff_image_mime(jpeg) == 'image/jpeg'

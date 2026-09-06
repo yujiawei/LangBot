@@ -149,6 +149,104 @@ class OctoRestClient:
             retry_on_429=False,
         )
 
+    async def upload_media(self, filename: str, data: bytes, content_type: str) -> str:
+        """Three-phase upload: presign -> PUT -> return the downloadUrl.
+
+        fileSize must be the exact byte count and the presign response's
+        contentType/contentDisposition must be replayed verbatim on the PUT:
+        both are folded into the signed canonical headers, and any mismatch
+        returns 403 SignatureDoesNotMatch.
+        """
+        if not data:
+            raise ValueError('octo: cannot upload empty media')
+        session = self._get_session()
+        headers = {'Authorization': f'Bearer {self.bot_token}'}
+        params = {'filename': filename, 'fileSize': str(len(data)), 'contentType': content_type}
+        async with session.get(
+            f'{self.api_url}/v1/bot/upload/presigned', params=params, headers=headers
+        ) as resp:
+            if resp.status >= 400:
+                raise OctoApiError(resp.status, (await resp.text())[:500])
+            presign = await resp.json()
+        upload_url = presign.get('uploadUrl')
+        download_url = presign.get('downloadUrl')
+        if not upload_url or not download_url:
+            raise OctoApiError(500, 'presign response missing uploadUrl/downloadUrl')
+
+        put_headers = {
+            'Content-Type': presign.get('contentType') or 'application/octet-stream',
+            'Content-Length': str(len(data)),
+        }
+        if presign.get('contentDisposition'):
+            put_headers['Content-Disposition'] = presign['contentDisposition']
+        async with session.put(
+            upload_url,
+            data=data,
+            headers=put_headers,
+            timeout=aiohttp.ClientTimeout(total=300),
+        ) as resp:
+            if resp.status >= 400:
+                raise OctoApiError(resp.status, f'presigned PUT failed: {(await resp.text())[:300]}')
+        return str(download_url)
+
+    async def send_media(
+        self,
+        channel_id: str,
+        channel_type: int,
+        media_type: int,
+        url: str,
+        name: typing.Optional[str] = None,
+        size: typing.Optional[int] = None,
+        width: typing.Optional[int] = None,
+        height: typing.Optional[int] = None,
+        client_msg_no: typing.Optional[str] = None,
+    ) -> SendMessageResult:
+        """Send an already-uploaded media message (type 2 image / 4 voice / 8 file)."""
+        if not channel_id or not channel_id.strip():
+            raise ValueError('octo: channel_id is required to send a message')
+        payload: dict = {'type': media_type, 'url': url}
+        if name:
+            payload['name'] = name
+        if size is not None:
+            payload['size'] = size
+        if width:
+            payload['width'] = width
+        if height:
+            payload['height'] = height
+        data = await self._post_json(
+            '/v1/bot/sendMessage',
+            {
+                'channel_id': channel_id,
+                'channel_type': channel_type,
+                'payload': payload,
+                'client_msg_no': client_msg_no or str(uuid.uuid4()),
+            },
+        )
+        return SendMessageResult.model_validate(data)
+
+    async def download_media(self, url: str, with_auth: bool, max_bytes: int) -> typing.Optional[bytes]:
+        """Download media content.
+
+        Inline media (images) is public-read object storage: no Authorization
+        header. File-message content requires the Bearer token. Sending the
+        token to public storage would leak it to a CDN; omitting it on file
+        content gets a 401 - do not mix the two up.
+        """
+        session = self._get_session()
+        headers = {'Authorization': f'Bearer {self.bot_token}'} if with_auth else {}
+        async with session.get(
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=120)
+        ) as resp:
+            if resp.status != 200:
+                return None
+            length = resp.headers.get('Content-Length')
+            if length and int(length) > max_bytes:
+                return None
+            data = await resp.content.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                return None
+            return data
+
     async def user_info(self, uid: str) -> typing.Optional[dict]:
         """GET /v1/bot/user/info; returns None when the endpoint is not deployed."""
         session = self._get_session()
