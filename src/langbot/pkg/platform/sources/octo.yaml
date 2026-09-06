@@ -39,6 +39,18 @@ spec:
       type: string
       required: true
       default: "http://localhost:8090/api"
+    - name: cdn_url
+      label:
+        en_US: CDN Base URL
+        zh_Hans: CDN 基础地址
+        zh_Hant: CDN 基礎地址
+      description:
+        en_US: Optional. CDN base URL for downloading media files; leave empty to fetch via the API server's /file path.
+        zh_Hans: 可选。媒体文件下载的 CDN 基础地址；留空则通过 API 服务器的 /file 路径获取。
+        zh_Hant: 可選。媒體檔案下載的 CDN 基礎地址；留空則透過 API 伺服器的 /file 路徑取得。
+      type: string
+      required: false
+      default: ""
     - name: ws_url
       label:
         en_US: WebSocket URL
