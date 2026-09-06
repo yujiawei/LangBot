@@ -208,3 +208,22 @@ class TestEventConverter:
     async def test_unknown_channel_type_dropped(self):
         msg = _msg({'type': 1, 'content': 'hi'}, channel_type=9)
         assert await OctoEventConverter.target2yiri(msg, BOT_UID) is None
+
+
+class TestReplyQuote:
+    def test_build_reply_quote_full_nested_structure(self):
+        # A bare message_id renders as an empty quote box on the server;
+        # the full nested structure is required.
+        msg = _msg({'type': 1, 'content': '原始消息', 'mention': {'ais': 1}})
+        quote = OctoMessageConverter.build_reply_quote(msg, '张三')
+        assert quote['message_id'] == msg.message_id
+        assert quote['from_uid'] == 'user1'
+        assert quote['from_name'] == '张三'
+        assert quote['payload']['content'] == '原始消息'
+        # mention/reply/event must be stripped from the quoted payload.
+        assert 'mention' not in quote['payload']
+
+    def test_build_reply_quote_falls_back_to_uid(self):
+        msg = _msg({'type': 1, 'content': 'hi'})
+        quote = OctoMessageConverter.build_reply_quote(msg, '')
+        assert quote['from_name'] == 'user1'

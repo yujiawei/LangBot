@@ -34,6 +34,8 @@ import langbot_plugin.api.entities.builtin.platform.events as platform_events
 import langbot_plugin.api.entities.builtin.platform.message as platform_message
 
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+TYPING_INTERVAL_SECONDS = 5.0
+TYPING_MAX_SECONDS = 120.0
 
 
 def _utf16_len(s: str) -> int:
@@ -149,6 +151,24 @@ class OctoMessageConverter(abstract_platform_adapter.AbstractMessageConverter):
             components.append(platform_message.Unknown(text='[Unsupported message type]'))
 
         return platform_message.MessageChain(components)
+
+    @staticmethod
+    def build_reply_quote(msg: OctoMessage, from_name: str) -> dict:
+        """Build the outbound quote block for replying to msg.
+
+        Servers do not resolve a bare message_id (it renders as an empty quote
+        box), so the full nested structure is required. mention/reply/event are
+        stripped from the quoted payload to keep the preview flat.
+        """
+        quoted_payload = msg.payload.model_dump(exclude_none=True)
+        for key in ('mention', 'reply', 'event'):
+            quoted_payload.pop(key, None)
+        return {
+            'message_id': msg.message_id,
+            'from_uid': msg.from_uid,
+            'from_name': from_name or msg.from_uid,
+            'payload': quoted_payload,
+        }
 
     @staticmethod
     def _payload_plain_text(payload_dict: dict) -> str:
@@ -304,6 +324,10 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
     _rest: typing.Optional[OctoRestClient] = pydantic.PrivateAttr(default=None)
     _ws: typing.Optional[OctoWSClient] = pydantic.PrivateAttr(default=None)
     _heartbeat_task: typing.Optional[asyncio.Task] = pydantic.PrivateAttr(default=None)
+    # One typing-indicator loop per reply channel, stopped when the reply goes out.
+    _typing_tasks: dict[str, asyncio.Task] = pydantic.PrivateAttr(default_factory=dict)
+    # uid -> display name cache for reply quotes.
+    _user_names: dict[str, str] = pydantic.PrivateAttr(default_factory=dict)
 
     listeners: typing.Dict[
         typing.Type[platform_events.Event],
@@ -332,6 +356,7 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
             channel_type = ChannelType.DM
         else:
             channel_type = ChannelType.COMMUNITY_TOPIC if is_thread_channel(target_id) else ChannelType.GROUP
+        self._stop_typing(target_id)
         content, mention = await OctoMessageConverter.yiri2target(message)
         if not content.strip():
             return
@@ -355,25 +380,39 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
         if self._rest is None:
             raise RuntimeError('Octo adapter is not running')
 
-        if source_msg.channel_type == ChannelType.DM:
-            # An inbound DM channel_id is a compound "sX_a@sX_b"; outbound DMs
-            # address the peer uid directly.
-            channel_id = source_msg.from_uid
-            channel_type = ChannelType.DM
-        else:
-            channel_id = source_msg.channel_id
-            channel_type = source_msg.channel_type
+        channel_id, channel_type = self._reply_channel(source_msg)
+        self._stop_typing(channel_id)
 
         content, mention = await OctoMessageConverter.yiri2target(message)
         if not content.strip():
             return
+        reply = None
+        if quote_origin:
+            from_name = await self._resolve_user_name(source_msg.from_uid)
+            reply = OctoMessageConverter.build_reply_quote(source_msg, from_name)
         await self._rest.send_text(
             channel_id=channel_id,
             channel_type=channel_type,
             content=content,
             mention=mention,
-            reply_message_id=source_msg.message_id if quote_origin else None,
+            reply=reply,
         )
+
+    async def _resolve_user_name(self, uid: str) -> str:
+        """Display name for a uid, via /v1/bot/user/info with a bounded cache."""
+        cached = self._user_names.get(uid)
+        if cached is not None:
+            return cached
+        name = ''
+        if self._rest is not None:
+            info = await self._rest.user_info(uid)
+            if info:
+                data = info.get('data') if isinstance(info.get('data'), dict) else info
+                name = str(data.get('name', '') or '')
+        self._user_names[uid] = name
+        while len(self._user_names) > 4096:
+            self._user_names.pop(next(iter(self._user_names)), None)
+        return name
 
     async def is_muted(self, group_id: int) -> bool:
         return False
@@ -455,9 +494,49 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
             return
         listener = self.listeners.get(type(event))
         if listener is not None:
+            self._start_typing(msg)
             await listener(event, self)
 
+    @staticmethod
+    def _reply_channel(msg: OctoMessage) -> tuple[str, int]:
+        """Channel a reply to msg goes to: DM peers are addressed by uid."""
+        if msg.channel_type == ChannelType.DM:
+            return msg.from_uid, ChannelType.DM
+        return msg.channel_id, msg.channel_type
+
+    def _start_typing(self, msg: OctoMessage) -> None:
+        """Read receipt + typing loop while the pipeline composes a reply."""
+        if self._rest is None:
+            return
+        channel_id, channel_type = self._reply_channel(msg)
+        self._stop_typing(channel_id)
+        self._typing_tasks[channel_id] = asyncio.create_task(
+            self._typing_loop(channel_id, channel_type, msg.message_id)
+        )
+
+    def _stop_typing(self, channel_id: str) -> None:
+        task = self._typing_tasks.pop(channel_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _typing_loop(self, channel_id: str, channel_type: int, message_id: str) -> None:
+        rest = self._rest
+        if rest is None:
+            return
+        try:
+            await rest.read_receipt(channel_id, channel_type, [message_id])
+        except Exception:
+            pass
+        for _ in range(int(TYPING_MAX_SECONDS / TYPING_INTERVAL_SECONDS)):
+            try:
+                await rest.typing(channel_id, channel_type)
+            except Exception:
+                pass
+            await asyncio.sleep(TYPING_INTERVAL_SECONDS)
+
     async def kill(self) -> bool:
+        for channel_id in list(self._typing_tasks):
+            self._stop_typing(channel_id)
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             try:

@@ -110,16 +110,22 @@ class OctoRestClient:
         channel_type: int,
         content: str,
         mention: typing.Optional[dict] = None,
-        reply_message_id: typing.Optional[str] = None,
+        reply: typing.Optional[dict] = None,
         client_msg_no: typing.Optional[str] = None,
     ) -> SendMessageResult:
+        """Send a text message.
+
+        ``reply`` must be the full nested quote structure
+        ``{message_id, from_uid, from_name, payload}``: servers do not resolve
+        a bare message_id and render an empty quote block for it.
+        """
         if not channel_id or not channel_id.strip():
             raise ValueError('octo: channel_id is required to send a message')
         payload: dict = {'type': 1, 'content': content}
         if mention:
             payload['mention'] = mention
-        if reply_message_id:
-            payload['reply'] = {'message_id': reply_message_id}
+        if reply:
+            payload['reply'] = reply
         data = await self._post_json(
             '/v1/bot/sendMessage',
             {
@@ -134,3 +140,35 @@ class OctoRestClient:
 
     async def heartbeat(self) -> None:
         await self._post_json('/v1/bot/heartbeat', {}, retry_on_429=False)
+
+    async def typing(self, channel_id: str, channel_type: int) -> None:
+        """Show the typing indicator in a channel. Discardable: no 429 retry."""
+        await self._post_json(
+            '/v1/bot/typing',
+            {'channel_id': channel_id, 'channel_type': channel_type},
+            retry_on_429=False,
+        )
+
+    async def user_info(self, uid: str) -> typing.Optional[dict]:
+        """GET /v1/bot/user/info; returns None when the endpoint is not deployed."""
+        session = self._get_session()
+        headers = {'Authorization': f'Bearer {self.bot_token}'}
+        try:
+            async with session.get(
+                f'{self.api_url}/v1/bot/user/info', params={'uid': uid}, headers=headers
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    async def read_receipt(
+        self, channel_id: str, channel_type: int, message_ids: typing.Optional[list[str]] = None
+    ) -> None:
+        """Mark messages as read. Discardable: no 429 retry."""
+        body: dict = {'channel_id': channel_id, 'channel_type': channel_type}
+        if message_ids:
+            body['message_ids'] = message_ids
+        await self._post_json('/v1/bot/readReceipt', body, retry_on_429=False)
