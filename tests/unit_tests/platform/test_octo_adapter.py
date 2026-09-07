@@ -301,3 +301,54 @@ class TestMediaHelpers:
         jpeg = b'\xff\xd8\xff\xc0\x00\x11\x08' + struct.pack('>HH', 480, 640) + b'\x00' * 20
         assert m.sniff_image_dimensions(jpeg) == (640, 480)
         assert m.sniff_image_mime(jpeg) == 'image/jpeg'
+
+
+class TestImageIntegrity:
+    def test_complete_and_truncated_png(self):
+        from langbot.libs.octo_api import media as m
+
+        png = b'\x89PNG\r\n\x1a\n' + b'\x00' * 40 + b'IEND\xaeB`\x82'
+        assert m.is_complete_image(png, 'image/png')
+        # A truncated PNG keeps a valid header but loses its IEND marker.
+        assert not m.is_complete_image(png[:-4], 'image/png')
+
+    def test_complete_and_truncated_jpeg(self):
+        from langbot.libs.octo_api import media as m
+
+        jpeg = b'\xff\xd8' + b'\x00' * 40 + b'\xff\xd9'
+        assert m.is_complete_image(jpeg, 'image/jpeg')
+        assert not m.is_complete_image(jpeg[:-2], 'image/jpeg')
+
+    def test_non_image_mime_is_not_checked(self):
+        from langbot.libs.octo_api import media as m
+
+        assert m.is_complete_image(b'anything', 'application/octet-stream')
+
+
+class TestDownloadMedia:
+    @pytest.mark.asyncio
+    async def test_download_reads_whole_body_across_chunks(self, aiohttp_server_factory):
+        """Regression: StreamReader.read(n) returns only buffered bytes, which
+        silently truncated multi-chunk downloads."""
+        from langbot.libs.octo_api import OctoRestClient
+
+        payload = bytes(range(256)) * 40  # ~10KB, delivered as delayed 1KB chunks
+        url = await aiohttp_server_factory(payload)
+        client = OctoRestClient(api_url='http://unused', bot_token='t')
+        try:
+            got = await client.download_media(url, with_auth=False, max_bytes=10 * 1024 * 1024)
+        finally:
+            await client.close()
+        assert got == payload
+
+    @pytest.mark.asyncio
+    async def test_download_rejects_oversize(self, aiohttp_server_factory):
+        from langbot.libs.octo_api import OctoRestClient
+
+        url = await aiohttp_server_factory(b'x' * 5000)
+        client = OctoRestClient(api_url='http://unused', bot_token='t')
+        try:
+            got = await client.download_media(url, with_auth=False, max_bytes=1000)
+        finally:
+            await client.close()
+        assert got is None

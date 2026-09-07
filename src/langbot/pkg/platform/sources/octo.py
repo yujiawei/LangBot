@@ -697,6 +697,13 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
                 mime = octo_media.sniff_image_mime(data)
                 if mime == 'application/octet-stream' and mime_hint:
                     mime = mime_hint
+                if mime.startswith('image/') and not octo_media.is_complete_image(data, mime):
+                    # Vision models reject a truncated image with an opaque
+                    # parse error; drop it and let the placeholder stand in.
+                    await self.logger.warning(
+                        f'Octo image download incomplete ({len(data)} bytes, {mime}), skipping inline'
+                    )
+                    return
                 downloads[rel_url] = (data, mime)
 
         if payload.type in (PayloadType.IMAGE, PayloadType.GIF):

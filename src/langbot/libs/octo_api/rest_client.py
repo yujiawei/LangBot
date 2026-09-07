@@ -240,12 +240,17 @@ class OctoRestClient:
             if resp.status != 200:
                 return None
             length = resp.headers.get('Content-Length')
-            if length and int(length) > max_bytes:
+            if length and length.isdigit() and int(length) > max_bytes:
                 return None
-            data = await resp.content.read(max_bytes + 1)
-            if len(data) > max_bytes:
-                return None
-            return data
+            # Accumulate to EOF: StreamReader.read(n) returns only what is
+            # currently buffered, which silently truncates the body (a
+            # truncated image is then rejected by vision models).
+            body = bytearray()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                body.extend(chunk)
+                if len(body) > max_bytes:
+                    return None
+            return bytes(body)
 
     async def user_info(self, uid: str) -> typing.Optional[dict]:
         """GET /v1/bot/user/info; returns None when the endpoint is not deployed."""

@@ -105,6 +105,27 @@ def sniff_image_dimensions(data: bytes) -> typing.Optional[tuple[int, int]]:
     return None
 
 
+def is_complete_image(data: bytes, mime: str) -> bool:
+    """Check that an image's terminating marker is present.
+
+    A truncated image still carries a parseable header, so it passes mime and
+    dimension sniffing and is only rejected later by the vision model as an
+    opaque "image parse error". Catch it at the download boundary instead.
+    """
+    if mime == 'image/png':
+        return data.endswith(b'IEND\xaeB`\x82')
+    if mime == 'image/jpeg':
+        return data.endswith(b'\xff\xd9')
+    if mime == 'image/gif':
+        return data.endswith(b'\x3b')
+    if mime == 'image/webp':
+        # RIFF stores its payload length in bytes 4..8, excluding the 8-byte header.
+        if len(data) < 12:
+            return False
+        return len(data) >= int.from_bytes(data[4:8], 'little') + 8
+    return True
+
+
 def sniff_image_mime(data: bytes) -> str:
     if data[:8] == b'\x89PNG\r\n\x1a\n':
         return 'image/png'
