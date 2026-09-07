@@ -593,3 +593,49 @@ class TestCapabilityCacheTTL:
         adapter._card_capability_at -= octo_mod.CARD_CAPABILITY_TTL_SECONDS + 1
         await adapter._get_card_capability()
         assert len(probes) == 1
+
+
+class TestGroupMentionMatching:
+    """The at-bot rule compares At.target to bot_account_id as an exact string,
+    so a space-prefixed mention uid must still resolve to the bot's own id."""
+
+    @pytest.mark.asyncio
+    async def test_space_prefixed_mention_resolves_to_bot_account_id(self):
+        text = '@Bot 帮我看看'
+        payload = {
+            'type': 1,
+            'content': text,
+            # The server names the bot with a space prefix; register()'s
+            # robot_id (BOT_UID) has none.
+            'mention': {'entities': [{'uid': f's14_{BOT_UID}', 'offset': 0, 'length': 4}]},
+        }
+        chain = await OctoMessageConverter.target2yiri(_msg(payload), BOT_UID)
+        ats = [c for c in chain if isinstance(c, platform_message.At)]
+        assert len(ats) == 1
+        assert str(ats[0].target) == BOT_UID, 'mention must match bot_account_id exactly'
+
+    @pytest.mark.asyncio
+    async def test_uids_fallback_also_normalized(self):
+        payload = {'type': 1, 'content': 'hi', 'mention': {'uids': [f's14_{BOT_UID}']}}
+        chain = await OctoMessageConverter.target2yiri(_msg(payload), BOT_UID)
+        ats = [c for c in chain if isinstance(c, platform_message.At)]
+        assert [str(a.target) for a in ats] == [BOT_UID]
+
+    @pytest.mark.asyncio
+    async def test_other_users_keep_their_uid(self):
+        text = '@张三 你看下'
+        payload = {
+            'type': 1,
+            'content': text,
+            'mention': {'entities': [{'uid': 's14_someoneelse', 'offset': 0, 'length': 3}]},
+        }
+        chain = await OctoMessageConverter.target2yiri(_msg(payload), BOT_UID)
+        ats = [c for c in chain if isinstance(c, platform_message.At)]
+        assert str(ats[0].target) == 's14_someoneelse'
+
+    @pytest.mark.asyncio
+    async def test_ais_flag_mention_matches_bot_account_id(self):
+        payload = {'type': 1, 'content': '@所有AI 在吗', 'mention': {'ais': 1}}
+        chain = await OctoMessageConverter.target2yiri(_msg(payload), BOT_UID)
+        ats = [c for c in chain if isinstance(c, platform_message.At)]
+        assert [str(a.target) for a in ats] == [BOT_UID]

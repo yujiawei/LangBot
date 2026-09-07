@@ -27,7 +27,7 @@ from langbot.libs.octo_api import (
 )
 from langbot.libs.octo_api import cards as octo_cards
 from langbot.libs.octo_api import media as octo_media
-from langbot.libs.octo_api.types import MentionInfo, is_thread_channel
+from langbot.libs.octo_api.types import MentionInfo, is_thread_channel, strip_space_prefix
 
 import base64
 import dataclasses
@@ -300,6 +300,18 @@ class OctoMessageConverter(abstract_platform_adapter.AbstractMessageConverter):
         if is_broadcast:
             components.append(platform_message.AtAll())
 
+        def canonical(uid: str) -> str:
+            """Emit the bot's own id exactly as bot_account_id spells it.
+
+            The at-bot response rule compares At.target to bot_account_id as
+            an exact string. Octo uids may carry an "s{space}_" prefix that
+            register()'s robot_id does not, so a space-scoped deployment would
+            never match and the bot would silently ignore every group mention.
+            """
+            if strip_space_prefix(uid)[1] == strip_space_prefix(bot_uid)[1]:
+                return bot_uid
+            return uid
+
         entities = [e for e in mention.entities if e.uid]
         entities.sort(key=lambda e: e.offset)
         index_map = _utf16_index_map(text)
@@ -313,14 +325,16 @@ class OctoMessageConverter(abstract_platform_adapter.AbstractMessageConverter):
             if start > cursor:
                 components.append(platform_message.Plain(text=text[cursor:start]))
             display = text[start:end].lstrip('@')
-            components.append(platform_message.At(target=entity.uid, display=display))
-            mentioned_uids.add(entity.uid)
+            target = canonical(entity.uid)
+            components.append(platform_message.At(target=target, display=display))
+            mentioned_uids.add(target)
             cursor = end
         if not entities and mention.uids:
             # Fallback when the server sent uids without entity spans.
-            mentioned_uids.update(mention.uids)
             for uid in mention.uids:
-                components.append(platform_message.At(target=uid))
+                target = canonical(uid)
+                mentioned_uids.add(target)
+                components.append(platform_message.At(target=target))
         if cursor < len(text):
             components.append(platform_message.Plain(text=text[cursor:]))
 
