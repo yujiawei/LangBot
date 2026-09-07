@@ -806,8 +806,24 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
             return
         listener = self.listeners.get(type(event))
         if listener is not None:
-            self._start_typing(msg)
+            if self._will_likely_reply(event):
+                self._start_typing(msg)
             await listener(event, self)
+
+    def _will_likely_reply(self, event: platform_events.MessageEvent) -> bool:
+        """Whether to show a typing indicator for this message.
+
+        Group messages are dropped by the default at-bot response rule unless
+        the bot is mentioned, and typing on a message that is never answered
+        reads as a hung bot. Mirror that rule rather than indicating on every
+        inbound message.
+        """
+        if isinstance(event, platform_events.FriendMessage):
+            return True
+        return any(
+            isinstance(component, platform_message.At) and str(component.target) == str(self.bot_account_id)
+            for component in event.message_chain
+        )
 
     @staticmethod
     def _reply_channel(msg: OctoMessage) -> tuple[str, int]:

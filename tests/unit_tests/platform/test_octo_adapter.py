@@ -639,3 +639,49 @@ class TestGroupMentionMatching:
         chain = await OctoMessageConverter.target2yiri(_msg(payload), BOT_UID)
         ats = [c for c in chain if isinstance(c, platform_message.At)]
         assert [str(a.target) for a in ats] == [BOT_UID]
+
+
+class TestTypingIndicatorGating:
+    """Typing on a message the pipeline will drop reads as a hung bot."""
+
+    @staticmethod
+    def _adapter():
+        adapter = TestStreamingCard._adapter()
+        adapter.bot_account_id = BOT_UID
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_dm_always_indicates(self):
+        adapter = self._adapter()
+        msg = _msg({'type': 1, 'content': 'hi'}, channel_type=1, from_uid='u1')
+        event = await OctoEventConverter.target2yiri(msg, BOT_UID)
+        assert adapter._will_likely_reply(event) is True
+
+    @pytest.mark.asyncio
+    async def test_group_without_mention_does_not_indicate(self):
+        adapter = self._adapter()
+        msg = _msg({'type': 1, 'content': '你好'}, channel_type=2)
+        event = await OctoEventConverter.target2yiri(msg, BOT_UID)
+        assert adapter._will_likely_reply(event) is False
+
+    @pytest.mark.asyncio
+    async def test_group_with_bot_mention_indicates(self):
+        adapter = self._adapter()
+        msg = _msg(
+            {'type': 1, 'content': '@Bot 在吗',
+             'mention': {'entities': [{'uid': BOT_UID, 'offset': 0, 'length': 4}]}},
+            channel_type=2,
+        )
+        event = await OctoEventConverter.target2yiri(msg, BOT_UID)
+        assert adapter._will_likely_reply(event) is True
+
+    @pytest.mark.asyncio
+    async def test_group_mention_of_someone_else_does_not_indicate(self):
+        adapter = self._adapter()
+        msg = _msg(
+            {'type': 1, 'content': '@张三 看下',
+             'mention': {'entities': [{'uid': 'other-uid', 'offset': 0, 'length': 3}]}},
+            channel_type=2,
+        )
+        event = await OctoEventConverter.target2yiri(msg, BOT_UID)
+        assert adapter._will_likely_reply(event) is False
