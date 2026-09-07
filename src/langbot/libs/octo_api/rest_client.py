@@ -10,6 +10,7 @@ Discardable calls (heartbeat) opt out of 429 retries entirely.
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import typing
 import uuid
@@ -18,6 +19,7 @@ import aiohttp
 
 from .types import RegisterResult, SendMessageResult
 
+CARD_VERSION = '1.5'
 DEFAULT_TIMEOUT_SECONDS = 30.0
 MAX_429_RETRIES = 2
 MAX_SINGLE_WAIT_SECONDS = 10.0
@@ -147,6 +149,107 @@ class OctoRestClient:
             '/v1/bot/typing',
             {'channel_id': channel_id, 'channel_type': channel_type},
             retry_on_429=False,
+        )
+
+    async def card_profile(self) -> dict:
+        """GET /v1/bot/card/profile - capability discovery, fail closed.
+
+        Returns {'available': False} when the endpoint is not deployed (404),
+        so callers never guess a server-side Bot policy locally.
+        """
+        session = self._get_session()
+        headers = {'Authorization': f'Bearer {self.bot_token}'}
+        async with session.get(f'{self.api_url}/v1/bot/card/profile', headers=headers) as resp:
+            if resp.status == 404:
+                return {'available': False, 'enabled': False}
+            if resp.status >= 400:
+                raise OctoApiError(resp.status, (await resp.text())[:300])
+            raw = await resp.json()
+        if not isinstance(raw, dict):
+            return {'available': True, 'enabled': False}
+        raw['available'] = True
+        # enabled is serialized as either boolean true or 1 depending on version.
+        raw['enabled'] = raw.get('enabled') is True or raw.get('enabled') == 1
+        return raw
+
+    async def send_card(
+        self,
+        channel_id: str,
+        channel_type: int,
+        card: dict,
+        plain: str,
+        profile: str = 'octo/v1',
+        client_msg_no: typing.Optional[str] = None,
+    ) -> SendMessageResult:
+        """Send an interactive card (payload type 17)."""
+        if not channel_id or not channel_id.strip():
+            raise ValueError('octo: channel_id is required to send a message')
+        payload = {
+            'type': 17,
+            'card': card,
+            'plain': plain,
+            'profile': profile,
+            'card_version': CARD_VERSION,
+        }
+        data = await self._post_json(
+            '/v1/bot/sendMessage',
+            {
+                'channel_id': channel_id,
+                'channel_type': channel_type,
+                'payload': payload,
+                'client_msg_no': client_msg_no or str(uuid.uuid4()),
+            },
+        )
+        return SendMessageResult.model_validate(data)
+
+    async def edit_card(
+        self,
+        message_id: str,
+        channel_id: str,
+        channel_type: int,
+        card: dict,
+        plain: str,
+        profile: str = 'octo/v1',
+        card_seq: typing.Optional[int] = None,
+        transient: bool = False,
+    ) -> None:
+        """Replace a sent card's content.
+
+        content_edit carries the complete type-17 envelope serialized to a JSON
+        string. card_seq must be reserved inside the same serialized section as
+        this call, so reservation order equals wire order - the server rejects
+        stale frames, and a higher seq committing first wedges the card
+        permanently. transient keeps intermediate frames out of the revision
+        history (capped at 20); terminal frames must not be transient.
+        """
+        if not message_id:
+            raise ValueError('octo: message_id is required to edit a card')
+        if not channel_id or not channel_id.strip():
+            raise ValueError('octo: channel_id is required to edit a card')
+        envelope: dict = {
+            'type': 17,
+            'card': card,
+            'plain': plain,
+            'profile': profile,
+            'card_version': CARD_VERSION,
+        }
+        if card_seq is not None:
+            if card_seq <= 0:
+                raise ValueError('octo: card_seq must be a positive integer')
+            envelope['card_seq'] = card_seq
+        if transient:
+            envelope['transient'] = True
+        await self._post_json(
+            '/v1/bot/message/edit',
+            {
+                'message_id': message_id,
+                'channel_id': channel_id,
+                'channel_type': channel_type,
+                'content_edit': json.dumps(envelope, ensure_ascii=False),
+            },
+            # A transient progress frame is discardable: holding the flush
+            # while backing off would block the frames queued behind it.
+            retry_on_429=not transient,
         )
 
     async def upload_media(self, filename: str, data: bytes, content_type: str) -> str:

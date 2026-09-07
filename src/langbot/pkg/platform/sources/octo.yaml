@@ -39,6 +39,18 @@ spec:
       type: string
       required: true
       default: "http://localhost:8090/api"
+    - name: enable-stream-reply
+      label:
+        en_US: Streaming Reply
+        zh_Hans: 流式回复
+        zh_Hant: 流式回覆
+      description:
+        en_US: Reply in an interactive card that updates as the model generates. Requires the server to have cards enabled for this bot; falls back to a normal message otherwise.
+        zh_Hans: 以卡片形式边生成边更新回复。需要服务端为此机器人启用卡片能力，否则自动回退为普通消息。
+        zh_Hant: 以卡片形式邊生成邊更新回覆。需要伺服端為此機器人啟用卡片能力，否則自動回退為普通訊息。
+      type: boolean
+      required: false
+      default: false
     - name: cdn_url
       label:
         en_US: CDN Base URL

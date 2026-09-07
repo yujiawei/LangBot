@@ -352,3 +352,218 @@ class TestDownloadMedia:
         finally:
             await client.close()
         assert got is None
+
+
+class TestCardCapability:
+    def test_fails_closed_when_endpoint_missing(self):
+        from langbot.libs.octo_api import cards as c
+
+        cap = c.parse_capability({'available': False, 'enabled': False})
+        assert not cap.can_send_display_card
+
+    def test_fails_closed_when_bot_policy_disables_cards(self):
+        from langbot.libs.octo_api import cards as c
+
+        cap = c.parse_capability(
+            {'available': True, 'enabled': True, 'profiles': ['octo/v1'], 'config': {'card_enabled': False}}
+        )
+        assert not cap.can_send_display_card
+
+    def test_enabled_with_display_profile(self):
+        from langbot.libs.octo_api import cards as c
+
+        cap = c.parse_capability(
+            {
+                'available': True,
+                'enabled': 1,  # numeric serialization
+                'profiles': ['octo/v1', 'octo/v2'],
+                'config': {'card_enabled': 1},
+                'limits': {'max_payload_bytes': 524288},
+            }
+        )
+        assert cap.can_send_display_card
+        assert cap.max_payload_bytes == 524288
+
+    def test_missing_profiles_fails_closed(self):
+        from langbot.libs.octo_api import cards as c
+
+        cap = c.parse_capability({'available': True, 'enabled': True})
+        assert not cap.can_send_display_card
+
+
+class TestCardBuilding:
+    def test_text_card_shape(self):
+        from langbot.libs.octo_api import cards as c
+
+        card = c.build_text_card('你好')
+        assert card['type'] == 'AdaptiveCard'
+        assert card['version'] == '1.5'
+        assert card['body'][0]['text'] == '你好'
+        assert card['body'][0]['wrap'] is True
+
+    def test_plain_preview_never_empty(self):
+        from langbot.libs.octo_api import cards as c
+
+        assert c.plain_preview('') == '[卡片]'
+        assert c.plain_preview('   \n ') == '[卡片]'
+        assert c.plain_preview('hello\n\nworld') == 'hello world'
+        long = c.plain_preview('字' * 500)
+        assert len(long) <= c.PLAIN_PREVIEW_CHARS
+
+    def test_fit_text_respects_envelope_limit(self):
+        import json
+        from langbot.libs.octo_api import cards as c
+
+        limit = 4096
+        fitted = c.fit_text_to_payload('长' * 20000, limit)
+        envelope = {
+            'type': 17,
+            'card': c.build_text_card(fitted),
+            'plain': c.plain_preview(fitted),
+            'profile': c.PROFILE_DISPLAY,
+            'card_version': c.CARD_VERSION,
+            'card_seq': 2**31,
+            'transient': True,
+        }
+        assert len(json.dumps(envelope, ensure_ascii=False).encode()) <= limit
+        assert fitted.endswith('（内容过长，已截断）')
+
+    def test_short_text_is_untouched(self):
+        from langbot.libs.octo_api import cards as c
+
+        assert c.fit_text_to_payload('短文本', 524288) == '短文本'
+
+
+class TestStreamingCard:
+    @staticmethod
+    def _adapter(cap_enabled=True, stream=True):
+        import langbot.pkg.platform.sources.octo as octo_mod
+
+        import langbot_plugin.api.definition.abstract.platform.event_logger as abstract_logger
+
+        class _Logger(abstract_logger.AbstractEventLogger):
+            async def info(self, *a, **k): pass
+            async def debug(self, *a, **k): pass
+            async def warning(self, *a, **k): pass
+            async def error(self, *a, **k): pass
+
+        adapter = octo_mod.OctoAdapter(
+            config={'api_url': 'http://x/api', 'bot_token': 'bf_x', 'enable-stream-reply': stream},
+            logger=_Logger(),
+        )
+        from langbot.libs.octo_api import cards as c
+
+        adapter._card_capability = c.CardCapability(
+            available=True, enabled=cap_enabled,
+            profiles=frozenset({'octo/v1'}) if cap_enabled else frozenset(),
+            max_payload_bytes=524288,
+        )
+        return adapter
+
+    class _FakeRest:
+        def __init__(self):
+            self.edits = []
+            self.texts = []
+            self.sent_cards = 0
+
+        async def send_text(self, **kw):
+            from langbot.libs.octo_api.types import SendMessageResult
+            self.texts.append(kw)
+            return SendMessageResult(message_id='text-msg-1')
+
+        async def user_info(self, uid):
+            return None
+
+        async def send_card(self, **kw):
+            from langbot.libs.octo_api.types import SendMessageResult
+            self.sent_cards += 1
+            return SendMessageResult(message_id='card-msg-1')
+
+        async def edit_card(self, **kw):
+            self.edits.append(kw)
+
+    class _BotMessage:
+        def __init__(self, rid='r1'):
+            self.resp_message_id = rid
+
+    @pytest.mark.asyncio
+    async def test_streaming_disabled_by_config(self):
+        adapter = self._adapter(stream=False)
+        assert await adapter.is_stream_output_supported() is False
+
+    @pytest.mark.asyncio
+    async def test_streaming_disabled_when_server_forbids_cards(self):
+        adapter = self._adapter(cap_enabled=False)
+        assert await adapter.is_stream_output_supported() is False
+
+    @pytest.mark.asyncio
+    async def test_streaming_enabled(self):
+        adapter = self._adapter()
+        assert await adapter.is_stream_output_supported() is True
+
+    @pytest.mark.asyncio
+    async def test_card_seq_is_monotonic_and_final_is_not_transient(self):
+        adapter = self._adapter()
+        rest = self._FakeRest()
+        adapter._rest = rest
+        msg = _msg({'type': 1, 'content': 'hi'}, channel_type=1, from_uid='u1')
+        event = await OctoEventConverter.target2yiri(msg, BOT_UID)
+
+        assert await adapter.create_message_card('r1', event) is True
+        assert rest.sent_cards == 1
+
+        bot_msg = self._BotMessage('r1')
+        # Force each chunk past the debounce window.
+        for text in ('一', '一二', '一二三'):
+            adapter._cards['r1'].last_edit_at = 0.0
+            chain = platform_message.MessageChain([platform_message.Plain(text=text)])
+            await adapter.reply_message_chunk(msg_event_stub(event), bot_msg, chain, is_final=(text == '一二三'))
+
+        seqs = [e['card_seq'] for e in rest.edits]
+        assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), f'card_seq must be monotonic: {seqs}'
+        assert all(e['transient'] for e in rest.edits[:-1]), 'progress frames must be transient'
+        assert rest.edits[-1]['transient'] is False, 'terminal frame must enter revision history'
+        assert rest.edits[-1]['card']['body'][0]['text'] == '一二三'
+        assert 'r1' not in adapter._cards, 'card state must be released after the final frame'
+
+    @pytest.mark.asyncio
+    async def test_debounce_skips_rapid_frames_but_final_always_sends(self):
+        adapter = self._adapter()
+        rest = self._FakeRest()
+        adapter._rest = rest
+        msg = _msg({'type': 1, 'content': 'hi'}, channel_type=1, from_uid='u1')
+        event = await OctoEventConverter.target2yiri(msg, BOT_UID)
+        await adapter.create_message_card('r1', event)
+        bot_msg = self._BotMessage('r1')
+
+        # Back-to-back chunks: the debounce window suppresses the middle ones.
+        for text in ('a', 'ab', 'abc'):
+            chain = platform_message.MessageChain([platform_message.Plain(text=text)])
+            await adapter.reply_message_chunk(msg_event_stub(event), bot_msg, chain, is_final=False)
+        assert len(rest.edits) <= 1
+
+        chain = platform_message.MessageChain([platform_message.Plain(text='abcd')])
+        await adapter.reply_message_chunk(msg_event_stub(event), bot_msg, chain, is_final=True)
+        assert rest.edits[-1]['card']['body'][0]['text'] == 'abcd'
+        assert rest.edits[-1]['transient'] is False
+
+    @pytest.mark.asyncio
+    async def test_unknown_card_falls_back_to_plain_reply_on_final(self):
+        adapter = self._adapter()
+        rest = self._FakeRest()
+        adapter._rest = rest
+        msg = _msg({'type': 1, 'content': 'hi'}, channel_type=1, from_uid='u1')
+        event = await OctoEventConverter.target2yiri(msg, BOT_UID)
+        chain = platform_message.MessageChain([platform_message.Plain(text='done')])
+
+        # No card exists for this id: intermediate chunks are dropped and only
+        # the terminal one is delivered, as a plain message.
+        await adapter.reply_message_chunk(event, self._BotMessage('missing'), chain, is_final=False)
+        assert rest.texts == []
+        await adapter.reply_message_chunk(event, self._BotMessage('missing'), chain, is_final=True)
+        assert [t['content'] for t in rest.texts] == ['done']
+        assert rest.edits == []
+
+
+def msg_event_stub(event):
+    return event

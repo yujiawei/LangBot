@@ -25,11 +25,14 @@ from langbot.libs.octo_api import (
     OctoWSClient,
     PayloadType,
 )
+from langbot.libs.octo_api import cards as octo_cards
 from langbot.libs.octo_api import media as octo_media
 from langbot.libs.octo_api.types import MentionInfo, is_thread_channel
 
 import base64
+import dataclasses
 import os
+import time
 
 import langbot_plugin.api.definition.abstract.platform.adapter as abstract_platform_adapter
 import langbot_plugin.api.definition.abstract.platform.event_logger as abstract_platform_logger
@@ -40,6 +43,29 @@ import langbot_plugin.api.entities.builtin.platform.message as platform_message
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 TYPING_INTERVAL_SECONDS = 5.0
 TYPING_MAX_SECONDS = 120.0
+# Minimum spacing between streaming card edits. Each chunk carries the full
+# accumulated text, so a skipped frame is superseded by the next one.
+CARD_EDIT_INTERVAL_SECONDS = 0.8
+CARD_STATE_MAX = 256
+
+
+@dataclasses.dataclass
+class _CardState:
+    """One in-flight streaming card, keyed by the runner's resp_message_id."""
+
+    card_message_id: str
+    channel_id: str
+    channel_type: int
+    lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
+    seq: int = 1
+    last_text: str = ''
+    last_edit_at: float = 0.0
+    finalized: bool = False
+
+    def next_seq(self) -> int:
+        """Reserve the next frame number. Callers must hold ``lock``."""
+        self.seq += 1
+        return self.seq
 
 
 def _utf16_len(s: str) -> int:
@@ -377,6 +403,9 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
     _typing_tasks: dict[str, asyncio.Task] = pydantic.PrivateAttr(default_factory=dict)
     # uid -> display name cache for reply quotes.
     _user_names: dict[str, str] = pydantic.PrivateAttr(default_factory=dict)
+    # resp_message_id -> streaming card state.
+    _cards: dict[str, _CardState] = pydantic.PrivateAttr(default_factory=dict)
+    _card_capability: typing.Optional[octo_cards.CardCapability] = pydantic.PrivateAttr(default=None)
 
     listeners: typing.Dict[
         typing.Type[platform_events.Event],
@@ -547,6 +576,136 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
 
     async def is_muted(self, group_id: int) -> bool:
         return False
+
+    # ─── Streaming card output ──────────────────────────────────────────────
+
+    async def is_stream_output_supported(self) -> bool:
+        """Stream only when the operator enabled it and the server allows cards.
+
+        Capability comes from the server, never from a local guess: a send
+        probe cannot tell "disabled" from "invalid", and a 404 means the
+        endpoint is not deployed at all.
+        """
+        if not self.config.get('enable-stream-reply'):
+            return False
+        capability = await self._get_card_capability()
+        return capability.can_send_display_card
+
+    async def _get_card_capability(self) -> octo_cards.CardCapability:
+        if self._card_capability is not None:
+            return self._card_capability
+        closed = octo_cards.CardCapability(False, False, frozenset(), octo_cards.DEFAULT_MAX_PAYLOAD_BYTES)
+        if self._rest is None:
+            return closed
+        try:
+            profile = await self._rest.card_profile()
+        except Exception as e:
+            await self.logger.warning(f'Octo card capability probe failed, cards disabled: {e}')
+            self._card_capability = closed
+            return closed
+        capability = octo_cards.parse_capability(profile)
+        self._card_capability = capability
+        await self.logger.info(
+            f'Octo card capability: enabled={capability.enabled} profiles={sorted(capability.profiles)}'
+        )
+        return capability
+
+    async def create_message_card(self, message_id: str, event: platform_events.MessageEvent) -> bool:
+        """Send the placeholder card that later chunks edit in place."""
+        source_msg = event.source_platform_object
+        if not isinstance(source_msg, OctoMessage) or self._rest is None:
+            return False
+        capability = await self._get_card_capability()
+        if not capability.can_send_display_card:
+            return False
+
+        channel_id, channel_type = self._reply_channel(source_msg)
+        try:
+            result = await self._rest.send_card(
+                channel_id=channel_id,
+                channel_type=channel_type,
+                card=octo_cards.build_text_card('…'),
+                plain=octo_cards.plain_preview(''),
+            )
+        except Exception:
+            await self.logger.error(f'Octo failed to create stream card: {traceback.format_exc()}')
+            return False
+        if not result.message_id:
+            return False
+
+        self._stop_typing(channel_id)
+        self._cards[str(message_id)] = _CardState(
+            card_message_id=result.message_id,
+            channel_id=channel_id,
+            channel_type=channel_type,
+        )
+        while len(self._cards) > CARD_STATE_MAX:
+            self._cards.pop(next(iter(self._cards)), None)
+        return True
+
+    async def reply_message_chunk(
+        self,
+        message_source: platform_events.MessageEvent,
+        bot_message: typing.Any,
+        message: platform_message.MessageChain,
+        quote_origin: bool = False,
+        is_final: bool = False,
+    ):
+        """Update the streaming card with the accumulated reply.
+
+        Each chunk carries the full text, so the card is replaced rather than
+        appended to, and a throttled-away frame is superseded by the next one.
+        """
+        state = self._cards.get(str(getattr(bot_message, 'resp_message_id', '')))
+        if state is None:
+            # No card (creation failed, or cards disabled mid-stream): only the
+            # terminal chunk is worth sending, as a plain message.
+            if is_final:
+                await self.reply_message(message_source, message, quote_origin)
+            return
+
+        content, _, media = await OctoMessageConverter.yiri2target(message)
+        capability = await self._get_card_capability()
+        text = octo_cards.fit_text_to_payload(content, capability.max_payload_bytes)
+
+        async with state.lock:
+            if state.finalized:
+                return
+            if text == state.last_text and not is_final:
+                return
+            now = time.monotonic()
+            if not is_final and now - state.last_edit_at < CARD_EDIT_INTERVAL_SECONDS:
+                return
+            # Reserved inside the lock so reservation order equals wire order:
+            # a higher seq committing first wedges the card permanently.
+            seq = state.next_seq()
+            try:
+                await self._rest.edit_card(
+                    message_id=state.card_message_id,
+                    channel_id=state.channel_id,
+                    channel_type=state.channel_type,
+                    card=octo_cards.build_text_card(text or '…'),
+                    plain=octo_cards.plain_preview(text),
+                    card_seq=seq,
+                    # Terminal frames must enter the revision history.
+                    transient=not is_final,
+                )
+            except Exception:
+                await self.logger.error(f'Octo card edit failed: {traceback.format_exc()}')
+                if not is_final:
+                    return
+            state.last_text = text
+            state.last_edit_at = now
+            if is_final:
+                state.finalized = True
+
+        if is_final:
+            self._cards.pop(str(getattr(bot_message, 'resp_message_id', '')), None)
+            for component in media:
+                try:
+                    await self._send_media_component(state.channel_id, state.channel_type, component)
+                except Exception:
+                    await self.logger.error(f'Octo failed to send streamed media: {traceback.format_exc()}')
 
     def register_listener(
         self,
@@ -725,6 +884,8 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
     async def kill(self) -> bool:
         for channel_id in list(self._typing_tasks):
             self._stop_typing(channel_id)
+        self._cards.clear()
+        self._card_capability = None
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             try:
