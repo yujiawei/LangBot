@@ -355,6 +355,41 @@ class OctoRestClient:
                     return None
             return bytes(body)
 
+    async def group_members(self, group_no: str) -> list[dict]:
+        """GET /v1/bot/groups/{group_no}/members.
+
+        Threads inherit their parent group's roster, so callers must pass the
+        parent group_no, never a composite thread channel id.
+        """
+        data = await self._get_json(f'/v1/bot/groups/{group_no}/members')
+        if isinstance(data, list):
+            return [m for m in data if isinstance(m, dict)]
+        if isinstance(data, dict):
+            members = data.get('members') or data.get('data')
+            if isinstance(members, list):
+                return [m for m in members if isinstance(m, dict)]
+        return []
+
+    async def group_info(self, group_no: str) -> typing.Optional[dict]:
+        """GET /v1/bot/groups/{group_no}."""
+        data = await self._get_json(f'/v1/bot/groups/{group_no}')
+        if isinstance(data, dict):
+            inner = data.get('data')
+            return inner if isinstance(inner, dict) else data
+        return None
+
+    async def _get_json(self, path: str) -> typing.Any:
+        """GET returning parsed JSON, or None on any non-200 / transport error."""
+        session = self._get_session()
+        headers = {'Authorization': f'Bearer {self.bot_token}'}
+        try:
+            async with session.get(f'{self.api_url}{path}', headers=headers) as resp:
+                if resp.status != 200:
+                    return None
+                return await resp.json()
+        except Exception:
+            return None
+
     async def user_info(self, uid: str) -> typing.Optional[dict]:
         """GET /v1/bot/user/info; returns None when the endpoint is not deployed."""
         session = self._get_session()

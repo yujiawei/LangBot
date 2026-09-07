@@ -27,7 +27,12 @@ from langbot.libs.octo_api import (
 )
 from langbot.libs.octo_api import cards as octo_cards
 from langbot.libs.octo_api import media as octo_media
-from langbot.libs.octo_api.types import MentionInfo, is_thread_channel, strip_space_prefix
+from langbot.libs.octo_api.types import (
+    MentionInfo,
+    is_thread_channel,
+    parent_group_no,
+    strip_space_prefix,
+)
 
 import base64
 import dataclasses
@@ -50,6 +55,9 @@ CARD_STATE_MAX = 256
 # Card policy is per-bot server state that an operator can change at any time,
 # so the probe result is cached with a TTL rather than for the process lifetime.
 CARD_CAPABILITY_TTL_SECONDS = 600.0
+# Group rosters change as people join and leave.
+ROSTER_TTL_SECONDS = 300.0
+NAME_CACHE_MAX = 4096
 
 
 @dataclasses.dataclass
@@ -355,6 +363,7 @@ class OctoEventConverter(abstract_platform_adapter.AbstractEventConverter):
         msg: OctoMessage,
         bot_uid: str,
         downloads: typing.Optional[dict[str, tuple[bytes, str]]] = None,
+        names: typing.Optional[dict[str, str]] = None,
     ) -> typing.Optional[platform_events.MessageEvent]:
         # System events (group_md_updated etc.) ride on ordinary messages.
         if msg.payload.event is not None:
@@ -369,11 +378,17 @@ class OctoEventConverter(abstract_platform_adapter.AbstractEventConverter):
         if not message_chain:
             return None
 
+        names = names or {}
+        # Fall back to the uid so the identity is never blank, but prefer the
+        # resolved display name: it reaches the model as the sender_name
+        # prompt variable.
+        sender_name = names.get(msg.from_uid) or msg.from_uid
+
         if msg.channel_type == ChannelType.DM:
             return platform_events.FriendMessage(
                 sender=platform_entities.Friend(
                     id=msg.from_uid,
-                    nickname=msg.from_uid,
+                    nickname=sender_name,
                     remark='',
                 ),
                 message_chain=message_chain,
@@ -387,11 +402,11 @@ class OctoEventConverter(abstract_platform_adapter.AbstractEventConverter):
             return platform_events.GroupMessage(
                 sender=platform_entities.GroupMember(
                     id=msg.from_uid,
-                    member_name=msg.from_uid,
+                    member_name=sender_name,
                     permission=platform_entities.Permission.Member,
                     group=platform_entities.Group(
                         id=msg.channel_id,
-                        name='',
+                        name=names.get('__group__', ''),
                         permission=platform_entities.Permission.Member,
                     ),
                     special_title='',
@@ -420,6 +435,9 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
     _typing_tasks: dict[str, asyncio.Task] = pydantic.PrivateAttr(default_factory=dict)
     # uid -> display name cache for reply quotes.
     _user_names: dict[str, str] = pydantic.PrivateAttr(default_factory=dict)
+    # group_no -> (fetched_at, {uid: name}) and group_no -> (fetched_at, name).
+    _rosters: dict[str, tuple[float, dict[str, str]]] = pydantic.PrivateAttr(default_factory=dict)
+    _group_names: dict[str, tuple[float, str]] = pydantic.PrivateAttr(default_factory=dict)
     # resp_message_id -> streaming card state.
     _cards: dict[str, _CardState] = pydantic.PrivateAttr(default_factory=dict)
     _card_capability: typing.Optional[octo_cards.CardCapability] = pydantic.PrivateAttr(default=None)
@@ -485,6 +503,7 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
         reply: typing.Optional[dict] = None,
     ) -> None:
         """Send text first (with mention/quote), then each media component."""
+        await self._fill_mention_displays(message, channel_id, channel_type)
         content, mention, media = await OctoMessageConverter.yiri2target(message)
         if content.strip():
             await self._rest.send_text(
@@ -501,6 +520,26 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
                 await self.logger.error(
                     f'Octo failed to send {type(component).__name__}: {traceback.format_exc()}'
                 )
+
+    async def _fill_mention_displays(
+        self,
+        message: platform_message.MessageChain,
+        channel_id: str,
+        channel_type: int,
+    ) -> None:
+        """Give bare At components a human-readable display name.
+
+        The pipeline's at-sender feature inserts At(target=<uid>) with no
+        display, which would otherwise render as a raw 32-hex uid in the
+        message text.
+        """
+        group_scope = channel_id if channel_type != ChannelType.DM else ''
+        for component in message:
+            if not isinstance(component, platform_message.At) or component.display:
+                continue
+            name = await self._resolve_user_name(str(component.target), group_scope)
+            if name:
+                component.display = name
 
     async def _send_media_component(
         self,
@@ -576,8 +615,20 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
             return data if len(data) <= octo_media.MAX_UPLOAD_BYTES else None
         return None
 
-    async def _resolve_user_name(self, uid: str) -> str:
-        """Display name for a uid, via /v1/bot/user/info with a bounded cache."""
+    async def _resolve_user_name(self, uid: str, group_channel_id: str = '') -> str:
+        """Display name for a uid.
+
+        Prefers the group roster (which carries per-group display names) and
+        falls back to /v1/bot/user/info. Returns '' when neither knows the uid,
+        so callers can decide their own placeholder.
+        """
+        if not uid:
+            return ''
+        if group_channel_id:
+            roster = await self._group_roster(group_channel_id)
+            name = roster.get(uid) or roster.get(strip_space_prefix(uid)[1])
+            if name:
+                return name
         cached = self._user_names.get(uid)
         if cached is not None:
             return cached
@@ -588,9 +639,66 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
                 data = info.get('data') if isinstance(info.get('data'), dict) else info
                 name = str(data.get('name', '') or '')
         self._user_names[uid] = name
-        while len(self._user_names) > 4096:
+        while len(self._user_names) > NAME_CACHE_MAX:
             self._user_names.pop(next(iter(self._user_names)), None)
         return name
+
+    async def _group_roster(self, channel_id: str) -> dict[str, str]:
+        """uid -> display name for a group, cached with a TTL.
+
+        Threads inherit the parent group's roster, so a composite thread
+        channel id is reduced to its parent group_no before the API call.
+        """
+        group_no = parent_group_no(channel_id)
+        now = time.monotonic()
+        cached = self._rosters.get(group_no)
+        if cached is not None and now - cached[0] < ROSTER_TTL_SECONDS:
+            return cached[1]
+        roster: dict[str, str] = {}
+        if self._rest is not None:
+            try:
+                for member in await self._rest.group_members(group_no):
+                    uid = str(member.get('uid', '') or '')
+                    name = str(member.get('name', '') or '')
+                    if uid and name:
+                        roster[uid] = name
+                        roster.setdefault(strip_space_prefix(uid)[1], name)
+            except Exception:
+                await self.logger.warning(f'Octo roster fetch failed for {group_no}: {traceback.format_exc()}')
+        self._rosters[group_no] = (now, roster)
+        while len(self._rosters) > 128:
+            self._rosters.pop(next(iter(self._rosters)), None)
+        return roster
+
+    async def _resolve_group_name(self, channel_id: str) -> str:
+        """Display name of a group (or of a thread's parent group)."""
+        group_no = parent_group_no(channel_id)
+        now = time.monotonic()
+        cached = self._group_names.get(group_no)
+        if cached is not None and now - cached[0] < ROSTER_TTL_SECONDS:
+            return cached[1]
+        name = ''
+        if self._rest is not None:
+            info = await self._rest.group_info(group_no)
+            if info:
+                name = str(info.get('name', '') or '')
+        self._group_names[group_no] = (now, name)
+        while len(self._group_names) > 128:
+            self._group_names.pop(next(iter(self._group_names)), None)
+        return name
+
+    async def _resolve_inbound_names(self, msg: OctoMessage) -> dict[str, str]:
+        """Names needed to render one inbound message: sender, group, mentions."""
+        names: dict[str, str] = {}
+        group_scope = msg.channel_id if msg.channel_type != ChannelType.DM else ''
+        sender_name = await self._resolve_user_name(msg.from_uid, group_scope)
+        if sender_name:
+            names[msg.from_uid] = sender_name
+        if group_scope:
+            group_name = await self._resolve_group_name(msg.channel_id)
+            if group_name:
+                names['__group__'] = group_name
+        return names
 
     async def is_muted(self, group_id: int) -> bool:
         return False
@@ -685,6 +793,7 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
                 await self.reply_message(message_source, message, quote_origin)
             return
 
+        await self._fill_mention_displays(message, state.channel_id, state.channel_type)
         content, _, media = await OctoMessageConverter.yiri2target(message)
         capability = await self._get_card_capability()
         text = octo_cards.fit_text_to_payload(content, capability.max_payload_bytes)
@@ -798,7 +907,8 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
     async def _handle_inbound_message(self, msg: OctoMessage):
         try:
             downloads = await self._download_inbound_media(msg)
-            event = await OctoEventConverter.target2yiri(msg, self.bot_account_id, downloads)
+            names = await self._resolve_inbound_names(msg)
+            event = await OctoEventConverter.target2yiri(msg, self.bot_account_id, downloads, names)
         except Exception:
             await self.logger.error(f'Octo event conversion error: {traceback.format_exc()}')
             return
@@ -923,6 +1033,9 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
             self._stop_typing(channel_id)
         self._cards.clear()
         self._card_capability = None
+        self._user_names.clear()
+        self._rosters.clear()
+        self._group_names.clear()
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             try:

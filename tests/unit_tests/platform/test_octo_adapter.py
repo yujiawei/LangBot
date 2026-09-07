@@ -685,3 +685,87 @@ class TestTypingIndicatorGating:
         )
         event = await OctoEventConverter.target2yiri(msg, BOT_UID)
         assert adapter._will_likely_reply(event) is False
+
+
+class TestIdentityResolution:
+    """Sender and group names reach the model as prompt variables, and bare
+    At components would otherwise render as raw 32-hex uids."""
+
+    class _Rest:
+        def __init__(self):
+            self.member_calls = []
+
+        async def group_members(self, group_no):
+            self.member_calls.append(group_no)
+            return [
+                {'uid': 'f6f4-uid', 'name': '余嘉伟', 'role': 1, 'robot': 0},
+                {'uid': BOT_UID, 'name': '嘉伟的分身', 'role': 0, 'robot': 1},
+            ]
+
+        async def group_info(self, group_no):
+            return {'name': '分身测试群'}
+
+        async def user_info(self, uid):
+            return {'uid': uid, 'name': '私聊用户'} if uid == 'dm-uid' else None
+
+    def _adapter(self):
+        adapter = TestStreamingCard._adapter()
+        adapter.bot_account_id = BOT_UID
+        adapter._rest = self._Rest()
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_group_sender_and_group_name_resolved(self):
+        adapter = self._adapter()
+        msg = _msg({'type': 1, 'content': 'hi'}, channel_type=2, channel_id='grp_1', from_uid='f6f4-uid')
+        names = await adapter._resolve_inbound_names(msg)
+        event = await OctoEventConverter.target2yiri(msg, BOT_UID, None, names)
+        assert event.sender.member_name == '余嘉伟'
+        assert event.sender.group.name == '分身测试群'
+
+    @pytest.mark.asyncio
+    async def test_thread_uses_parent_group_roster(self):
+        adapter = self._adapter()
+        msg = _msg({'type': 1, 'content': 'hi'}, channel_type=5,
+                   channel_id='grp_1____t7x9', from_uid='f6f4-uid')
+        names = await adapter._resolve_inbound_names(msg)
+        # The roster API must be called with the parent group_no, never the
+        # composite thread channel id.
+        assert adapter._rest.member_calls == ['grp_1']
+        assert names['f6f4-uid'] == '余嘉伟'
+
+    @pytest.mark.asyncio
+    async def test_dm_nickname_falls_back_to_user_info(self):
+        adapter = self._adapter()
+        msg = _msg({'type': 1, 'content': 'hi'}, channel_type=1, from_uid='dm-uid')
+        names = await adapter._resolve_inbound_names(msg)
+        event = await OctoEventConverter.target2yiri(msg, BOT_UID, None, names)
+        assert event.sender.nickname == '私聊用户'
+        assert adapter._rest.member_calls == [], 'DMs must not hit the roster API'
+
+    @pytest.mark.asyncio
+    async def test_unknown_uid_keeps_uid_as_identity(self):
+        adapter = self._adapter()
+        msg = _msg({'type': 1, 'content': 'hi'}, channel_type=1, from_uid='nobody')
+        names = await adapter._resolve_inbound_names(msg)
+        event = await OctoEventConverter.target2yiri(msg, BOT_UID, None, names)
+        assert event.sender.nickname == 'nobody'
+
+    @pytest.mark.asyncio
+    async def test_bare_at_gets_display_name_outbound(self):
+        adapter = self._adapter()
+        chain = platform_message.MessageChain(
+            [platform_message.At(target='f6f4-uid'), platform_message.Plain(text=' 收到了')]
+        )
+        await adapter._fill_mention_displays(chain, 'grp_1', 2)
+        content, mention, _ = await OctoMessageConverter.yiri2target(chain)
+        assert content.startswith('@余嘉伟'), f'raw uid leaked into text: {content}'
+        assert mention['entities'][0]['uid'] == 'f6f4-uid'
+
+    @pytest.mark.asyncio
+    async def test_roster_is_cached_across_messages(self):
+        adapter = self._adapter()
+        msg = _msg({'type': 1, 'content': 'hi'}, channel_type=2, channel_id='grp_1', from_uid='f6f4-uid')
+        await adapter._resolve_inbound_names(msg)
+        await adapter._resolve_inbound_names(msg)
+        assert adapter._rest.member_calls == ['grp_1'], 'roster must be cached, not refetched per message'
