@@ -453,6 +453,8 @@ class TestStreamingCard:
         )
         from langbot.libs.octo_api import cards as c
 
+        import time as _t
+        adapter._card_capability_at = _t.monotonic()
         adapter._card_capability = c.CardCapability(
             available=True, enabled=cap_enabled,
             profiles=frozenset({'octo/v1'}) if cap_enabled else frozenset(),
@@ -567,3 +569,27 @@ class TestStreamingCard:
 
 def msg_event_stub(event):
     return event
+
+
+class TestCapabilityCacheTTL:
+    @pytest.mark.asyncio
+    async def test_capability_is_reprobed_after_ttl(self):
+        import langbot.pkg.platform.sources.octo as octo_mod
+
+        adapter = TestStreamingCard._adapter()
+        probes = []
+
+        class _Rest:
+            async def card_profile(self):
+                probes.append(1)
+                return {'available': True, 'enabled': True, 'profiles': ['octo/v1'],
+                        'config': {'card_enabled': True}, 'limits': {'max_payload_bytes': 524288}}
+
+        adapter._rest = _Rest()
+        # Fresh cache: no probe.
+        await adapter._get_card_capability()
+        assert probes == []
+        # Expire it: the server policy is re-read rather than trusted forever.
+        adapter._card_capability_at -= octo_mod.CARD_CAPABILITY_TTL_SECONDS + 1
+        await adapter._get_card_capability()
+        assert len(probes) == 1

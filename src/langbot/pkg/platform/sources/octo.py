@@ -47,6 +47,9 @@ TYPING_MAX_SECONDS = 120.0
 # accumulated text, so a skipped frame is superseded by the next one.
 CARD_EDIT_INTERVAL_SECONDS = 0.8
 CARD_STATE_MAX = 256
+# Card policy is per-bot server state that an operator can change at any time,
+# so the probe result is cached with a TTL rather than for the process lifetime.
+CARD_CAPABILITY_TTL_SECONDS = 600.0
 
 
 @dataclasses.dataclass
@@ -406,6 +409,7 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
     # resp_message_id -> streaming card state.
     _cards: dict[str, _CardState] = pydantic.PrivateAttr(default_factory=dict)
     _card_capability: typing.Optional[octo_cards.CardCapability] = pydantic.PrivateAttr(default=None)
+    _card_capability_at: float = pydantic.PrivateAttr(default=0.0)
 
     listeners: typing.Dict[
         typing.Type[platform_events.Event],
@@ -592,7 +596,8 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
         return capability.can_send_display_card
 
     async def _get_card_capability(self) -> octo_cards.CardCapability:
-        if self._card_capability is not None:
+        now = time.monotonic()
+        if self._card_capability is not None and now - self._card_capability_at < CARD_CAPABILITY_TTL_SECONDS:
             return self._card_capability
         closed = octo_cards.CardCapability(False, False, frozenset(), octo_cards.DEFAULT_MAX_PAYLOAD_BYTES)
         if self._rest is None:
@@ -602,9 +607,11 @@ class OctoAdapter(abstract_platform_adapter.AbstractMessagePlatformAdapter):
         except Exception as e:
             await self.logger.warning(f'Octo card capability probe failed, cards disabled: {e}')
             self._card_capability = closed
+            self._card_capability_at = now
             return closed
         capability = octo_cards.parse_capability(profile)
         self._card_capability = capability
+        self._card_capability_at = now
         await self.logger.info(
             f'Octo card capability: enabled={capability.enabled} profiles={sorted(capability.profiles)}'
         )
